@@ -59,56 +59,58 @@ if (-not [System.Net.IPAddress]::TryParse($SourceIP, [ref]$parsedIP)) {
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $speedtestPath = Join-Path $scriptDir "speedtest.exe"
 
-# Run speedtest and parse output
 try {
+    # Run speedtest and parse output
     $result = & "$speedtestPath" -i "$SourceIP" -f json 2>$null
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -ne 0 -or -not $result) {
-        Write-Output @"
+        throw "Speedtest exited with code ${exitCode}. Output: $result"
+    }
+
+    $data = $result | ConvertFrom-Json
+} catch {
+    Write-Output @"
 <prtg>
   <error>1</error>
-  <text>Speedtest exited with code ${exitCode}. Output: $result</text>
+  <text>Speedtest failed: $_</text>
 </prtg>
 "@
-        exit 1
-    }
+    exit 1
+}
 
-    # Parse JSON result
-    $data = $result | ConvertFrom-Json
+# Convert bandwidth (bytes/sec) to bits per second for PRTG (integer)
+$downloadBits = 0
+$uploadBits = 0
+if ($data.download.bandwidth -is [int] -or $data.download.bandwidth -is [double]) {
+    $downloadBits = [math]::Round($data.download.bandwidth * 8)
+}
+if ($data.upload.bandwidth -is [int] -or $data.upload.bandwidth -is [double]) {
+    $uploadBits = [math]::Round($data.upload.bandwidth * 8)
+}
 
-    # Convert bandwidth (bytes/sec) to bits per second for PRTG (integer)
-    $downloadBits = 0
-    $uploadBits = 0
-    if ($data.download.bandwidth -is [int] -or $data.download.bandwidth -is [double]) {
-        $downloadBits = [math]::Round($data.download.bandwidth * 8)
-    }
-    if ($data.upload.bandwidth -is [int] -or $data.upload.bandwidth -is [double]) {
-        $uploadBits = [math]::Round($data.upload.bandwidth * 8)
-    }
+$pingMs = 0
+if ($data.ping.latency -is [int] -or $data.ping.latency -is [double]) {
+    $pingMs = [math]::Round($data.ping.latency, 2)
+}
 
-    $pingMs = 0
-    if ($data.ping.latency -is [int] -or $data.ping.latency -is [double]) {
-        $pingMs = [math]::Round($data.ping.latency, 2)
-    }
+# Compose summary <text> for PRTG
+$text = "Speedtest via ${SourceIP} on $($data.server.host)"
+$isp = $data.isp
+$extip = $data.interface.externalIp
+$serverip = $data.server.ip
+$serverloc = $data.server.location
+$servercountry = $data.server.country
 
-    # Compose summary <text> for PRTG
-    $text = "Speedtest via ${SourceIP} on $($data.server.host)"
-    $isp = $data.isp
-    $extip = $data.interface.externalIp
-    $serverip = $data.server.ip
-    $serverloc = $data.server.location
-    $servercountry = $data.server.country
+$extraText = @()
+if ($isp) { $extraText += "ISP: $isp" }
+if ($extip) { $extraText += "ExternalIP: $extip" }
+if ($serverip) { $extraText += "ServerIP: $serverip" }
+if ($serverloc -or $servercountry) { $extraText += "ServerLocation: $serverloc, $servercountry" }
+if ($extraText.Count -gt 0) { $text += " | " + ($extraText -join " | ") }
 
-    $extraText = @()
-    if ($isp) { $extraText += "ISP: $isp" }
-    if ($extip) { $extraText += "ExternalIP: $extip" }
-    if ($serverip) { $extraText += "ServerIP: $serverip" }
-    if ($serverloc -or $servercountry) { $extraText += "ServerLocation: $serverloc, $servercountry" }
-    if ($extraText.Count -gt 0) { $text += " | " + ($extraText -join " | ") }
-
-    # Start XML result with mandatory channels and best practices
-    $prtgResults = @"
+# Start XML result with mandatory channels and best practices
+$prtgResults = @"
 <prtg>
   <result>
     <channel>Download Speed</channel>
@@ -131,11 +133,46 @@ try {
   </result>
 "@
 
-    # Optional detailed stats if requested
-    if ($DetailedOutput) {
-        # Download Latency
-        if ($data.download.latency.iqm) {
-            $prtgResults += @"
+# Handle timeouts and failed lookups
+if ($data.ping.latency -eq $null -or $data.ping.latency -gt 5000) {
+    $prtgResults += @"
+  <result>
+    <channel>Ping - Response time</channel>
+    <value>5000</value>
+    <Float>1</Float>
+    <unit>TimeResponse</unit>
+    <CustomUnit>ms</CustomUnit>
+  </result>
+  <text>Ping response time exceeded threshold or timed out.</text>
+"@
+}
+
+# Handle HTTP response code failures
+if ($data.httpResponseCode -eq "Request Time-out" -or $data.httpResponseCode -eq "Failed") {
+    $prtgResults += @"
+  <result>
+    <channel>HTTP Response Code</channel>
+    <value>0</value>
+    <unit>Custom</unit>
+    <CustomUnit>Code</CustomUnit>
+  </result>
+  <text>HTTP response code indicates a timeout or failure.</text>
+"@
+}
+
+# Default values for missing data
+if (-not $data.ping.latency) {
+    $data.ping.latency = 5000  # Default to 5000 ms for timeouts
+}
+if (-not $data.httpResponseCode) {
+    $data.httpResponseCode = "Request Time-out"  # Default to timeout message
+}
+
+# Optional detailed stats if requested
+if ($DetailedOutput) {
+    # Download Latency
+    if ($data.download.latency.iqm) {
+        $prtgResults += @"
   <result>
     <channel>Download Latency IQM</channel>
     <value>$($data.download.latency.iqm)</value>
@@ -144,9 +181,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.download.latency.low) {
-            $prtgResults += @"
+    }
+    if ($data.download.latency.low) {
+        $prtgResults += @"
   <result>
     <channel>Download Latency Low</channel>
     <value>$($data.download.latency.low)</value>
@@ -155,9 +192,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.download.latency.high) {
-            $prtgResults += @"
+    }
+    if ($data.download.latency.high) {
+        $prtgResults += @"
   <result>
     <channel>Download Latency High</channel>
     <value>$($data.download.latency.high)</value>
@@ -166,9 +203,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.download.latency.jitter) {
-            $prtgResults += @"
+    }
+    if ($data.download.latency.jitter) {
+        $prtgResults += @"
   <result>
     <channel>Download Jitter</channel>
     <value>$($data.download.latency.jitter)</value>
@@ -177,10 +214,10 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        # Upload Latency
-        if ($data.upload.latency.iqm) {
-            $prtgResults += @"
+    }
+    # Upload Latency
+    if ($data.upload.latency.iqm) {
+        $prtgResults += @"
   <result>
     <channel>Upload Latency IQM</channel>
     <value>$($data.upload.latency.iqm)</value>
@@ -189,9 +226,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.upload.latency.low) {
-            $prtgResults += @"
+    }
+    if ($data.upload.latency.low) {
+        $prtgResults += @"
   <result>
     <channel>Upload Latency Low</channel>
     <value>$($data.upload.latency.low)</value>
@@ -200,9 +237,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.upload.latency.high) {
-            $prtgResults += @"
+    }
+    if ($data.upload.latency.high) {
+        $prtgResults += @"
   <result>
     <channel>Upload Latency High</channel>
     <value>$($data.upload.latency.high)</value>
@@ -211,9 +248,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.upload.latency.jitter) {
-            $prtgResults += @"
+    }
+    if ($data.upload.latency.jitter) {
+        $prtgResults += @"
   <result>
     <channel>Upload Jitter</channel>
     <value>$($data.upload.latency.jitter)</value>
@@ -222,10 +259,10 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        # Ping details
-        if ($data.ping.jitter) {
-            $prtgResults += @"
+    }
+    # Ping details
+    if ($data.ping.jitter) {
+        $prtgResults += @"
   <result>
     <channel>Ping Jitter</channel>
     <value>$($data.ping.jitter)</value>
@@ -234,9 +271,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.ping.low) {
-            $prtgResults += @"
+    }
+    if ($data.ping.low) {
+        $prtgResults += @"
   <result>
     <channel>Ping Low</channel>
     <value>$($data.ping.low)</value>
@@ -245,9 +282,9 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        if ($data.ping.high) {
-            $prtgResults += @"
+    }
+    if ($data.ping.high) {
+        $prtgResults += @"
   <result>
     <channel>Ping High</channel>
     <value>$($data.ping.high)</value>
@@ -256,11 +293,11 @@ try {
     <CustomUnit>ms</CustomUnit>
   </result>
 "@
-        }
-        # PacketLoss
-        if ($null -ne $data.packetLoss) {
-            $packetLossPct = [math]::Round($data.packetLoss, 3)
-            $prtgResults += @"
+    }
+    # PacketLoss
+    if ($null -ne $data.packetLoss) {
+        $packetLossPct = [math]::Round($data.packetLoss, 3)
+        $prtgResults += @"
   <result>
     <channel>Packet Loss</channel>
     <value>$packetLossPct</value>
@@ -268,21 +305,11 @@ try {
     <unit>Percent</unit>
   </result>
 "@
-        }
     }
-
-    # Close XML with summary text
-    $prtgResults += "  <text>$text</text>`n</prtg>"
-
-    # Output final PRTG XML (only this!)
-    Write-Output $prtgResults
 }
-catch {
-    # Always return PRTG error XML on exception
-    Write-Output @"
-<prtg>
-  <error>1</error>
-  <text>Speedtest failed with source ${SourceIP}: $_</text>
-</prtg>
-"@
-}
+
+# Close XML with summary text
+$prtgResults += "  <text>$text</text>`n</prtg>"
+
+# Output final PRTG XML (only this!)
+Write-Output $prtgResults
