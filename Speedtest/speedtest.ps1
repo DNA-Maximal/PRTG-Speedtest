@@ -1,315 +1,217 @@
 <#
 .SYNOPSIS
-    Runs Speedtest CLI with a specific source IP and outputs PRTG-compatible XML for multi-channel monitoring.
+  Runs Speedtest CLI with a specific source IP and outputs PRTG-compatible XML for multi-channel monitoring.
 
 .DESCRIPTION
-    - Accepts interface IP as parameter (-i or --ipaddress or as first argument).
-    - Supports optional detailed result mode.
-    - Handles errors robustly and always returns valid PRTG XML.
-    - Converts speedtest bandwidth to bits per second and outputs additional stats if requested.
-    - Follows PRTG best practices for channel units and float handling.
+  - Accepts interface IP as parameter (-i or --ipaddress or as first argument).
+  - Supports optional detailed result mode.
+  - Handles errors robustly and always returns valid PRTG XML.
+  - Converts speedtest bandwidth to bits per second and outputs additional stats if requested.
+  - Follows PRTG best practices for channel units and float handling.
 
 .PARAMETER i
-    Source IP/Interface to use for speedtest.
+  Source IP/Interface to use for speedtest.
 
 .PARAMETER ipaddress
-    Alternative parameter for source IP.
+  Alternative parameter for source IP.
 
 .PARAMETER d
-    Switch for detailed output.
+  Switch for detailed output.
 
 .PARAMETER detailed
-    Alternative switch for detailed output.
+  Alternative switch for detailed output.
 
 .EXAMPLE
-    .\speedtest.ps1 -i 192.168.1.5 -detailed
+  .\speedtest.ps1 -i 192.168.1.5 -detailed
 #>
 
 param(
-    [string]$i,
-    [string]$ipaddress,
-    [switch]$d,
-    [switch]$detailed
+  [string]$i,
+  [string]$ipaddress,
+  [switch]$d,
+  [switch]$detailed
 )
 
 # Parse source IP/interface argument
-$SourceIP = $null
-if ($i) { $SourceIP = $i }
-elseif ($ipaddress) { $SourceIP = $ipaddress }
-elseif ($args.Count -ge 1) { $SourceIP = $args[0] }
+$SourceIP = $i ?? $ipaddress ?? $args[0]
 
 # Determine if detailed output is requested
-$DetailedOutput = $false
-if ($d -or $detailed) { $DetailedOutput = $true }
-elseif ($args -contains "-d" -or $args -contains "--detailed") { $DetailedOutput = $true }
+if ($d -or $detailed) {
+  $DetailedOutput = $true
+} elseif ($args -contains "-d" -or $args -contains "--detailed") {
+if ($SourceIP -and -not [System.Net.IPAddress]::TryParse($SourceIP, [ref]$null)) {
+  # Log the invalid IP for debugging purposes
+  Write-Host "Debug: Invalid IP address provided - '${SourceIP}'" | Out-File -FilePath "debug.log" -Append
 
-# Validate provided IP address (IPv4 or IPv6)
-$parsedIP = $null
-if (-not [System.Net.IPAddress]::TryParse($SourceIP, [ref]$parsedIP)) {
-    Write-Output @"
+  Write-Output @"
 <prtg>
   <error>1</error>
   <text>Invalid source IP address specified: '${SourceIP}'. Please provide a valid IPv4 or IPv6 address.</text>
 </prtg>
 "@
-    exit 1
+  exit 1
+}
+  <error>1</error>
+  <text>Invalid source IP address specified: '${SourceIP}'. Please provide a valid IPv4 or IPv6 address.</text>
+</prtg>
+"@
+  exit 1
 }
 
 # Locate speedtest.exe in the script directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $speedtestPath = Join-Path $scriptDir "speedtest.exe"
 
-try {
-    # Run speedtest and parse output
-    $result = & "$speedtestPath" -i "$SourceIP" -f json 2>$null
-    $exitCode = $LASTEXITCODE
+# Retry logic for Speedtest execution
+$retryDelay = 10 # Initial delay in seconds
+$data = $null
 
-    if ($exitCode -ne 0 -or -not $result) {
-        throw "Speedtest exited with code ${exitCode}. Output: $result"
-    }
-
-    $data = $result | ConvertFrom-Json
-} catch {
-    Write-Output @"
+# Validate $SourceIP before executing the command
+if ($SourceIP -and -not [System.Net.IPAddress]::TryParse($SourceIP, [ref]$null)) {
+  Write-Output @"
 <prtg>
   <error>1</error>
-  <text>Speedtest failed: $_</text>
+  <text>Invalid or empty source IP address specified: '${SourceIP}'. Please provide a valid IPv4 or IPv6 address.</text>
 </prtg>
 "@
-    exit 1
+  exit 1
+}
+$retryCount = 0
+$success = $false
+$data = $null
+
+while ($retryCount -lt $maxRetries -and -not $success) {
+  try {
+    # Dynamically include the -i argument only if $SourceIP is set
+    $result = if ($SourceIP) {
+      & "$speedtestPath" -i "$SourceIP" -f json 2>$null
+    } else {
+      & "$speedtestPath" -f json 2>$null
+    }
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -eq 429) {
+      Write-Host "Rate limit hit. Retrying in $retryDelay seconds..."
+      Start-Sleep -Seconds $retryDelay
+      $retryCount++
+      $retryDelay *= 2 # Double the delay for the next retry
+    } elseif ($exitCode -ne 0 -or -not $result) {
+      throw "Speedtest exited with code ${exitCode}. Output: $result"
+    } else {
+      $success = $true
+      $data = $result | ConvertFrom-Json -ErrorAction Stop
+    }
+  } catch {
+    if ($retryCount -ge $maxRetries) {
+      Write-Output @"
+<prtg>
+  <error>1</error>
+  <text>Speedtest failed after $maxRetries retries: $_</text>
+</prtg>
+"@
+      exit 1
+    }
+  }
 }
 
-# Convert bandwidth (bytes/sec) to bits per second for PRTG (integer)
-$downloadBits = 0
-$uploadBits = 0
-if ($data.download.bandwidth -is [int] -or $data.download.bandwidth -is [double]) {
-    $downloadBits = [math]::Round($data.download.bandwidth * 8)
+$downloadBits = if ($data.download.bandwidth -ne $null) {
+  [math]::Round(($data.download.bandwidth * 8) -as [double], 0)
+} else {
+  0
 }
-if ($data.upload.bandwidth -is [int] -or $data.upload.bandwidth -is [double]) {
-    $uploadBits = [math]::Round($data.upload.bandwidth * 8)
+$uploadBits = if ($data.upload.bandwidth -ne $null) {
+  [math]::Round(($data.upload.bandwidth * 8) -as [double], 0)
+} else {
+  0
 }
-
-$pingMs = 0
-if ($data.ping.latency -is [int] -or $data.ping.latency -is [double]) {
-    $pingMs = [math]::Round($data.ping.latency, 2)
-}
-
+<prtg>
+  <error>1</error>
+  <text>Speedtest failed: Unable to retrieve valid data.</text>
+</prtg>
+"@
+  exit 1
+$text = "Speedtest via $SourceIP on $($data.server.host)"
+$extraText = @()
+if ($data.isp) { $extraText += "ISP: $($data.isp)" }
+if ($data.interface.externalIp) { $extraText += "ExternalIP: $($data.interface.externalIp)" }
+if ($data.server.ip) { $extraText += "ServerIP: $($data.server.ip)" }
+if ($data.server.location -or $data.server.country) { $extraText += "ServerLocation: $($data.server.location), $($data.server.country)" }
+if ($extraText.Count -gt 0) { $text = "$text | $($extraText -join ' | ')" }
 # Compose summary <text> for PRTG
 $text = "Speedtest via ${SourceIP} on $($data.server.host)"
-$isp = $data.isp
-$extip = $data.interface.externalIp
-$serverip = $data.server.ip
-$serverloc = $data.server.location
-$servercountry = $data.server.country
-
 $extraText = @()
-if ($isp) { $extraText += "ISP: $isp" }
-if ($extip) { $extraText += "ExternalIP: $extip" }
-if ($serverip) { $extraText += "ServerIP: $serverip" }
-if ($serverloc -or $servercountry) { $extraText += "ServerLocation: $serverloc, $servercountry" }
+if ($data.isp) { $extraText += "ISP: $($data.isp)" }
+if ($data.interface.externalIp) { $extraText += "ExternalIP: $($data.interface.externalIp)" }
+if ($data.server.ip) { $extraText += "ServerIP: $($data.server.ip)" }
+if ($data.server.location -or $data.server.country) { $extraText += "ServerLocation: $($data.server.location), $($data.server.country)" }
 if ($extraText.Count -gt 0) { $text += " | " + ($extraText -join " | ") }
 
 # Start XML result with mandatory channels and best practices
-$prtgResults = @"
+$prtgResults = New-Object -TypeName System.Text.StringBuilder
 <prtg>
-  <result>
-    <channel>Download Speed</channel>
-    <value>$downloadBits</value>
-    <unit>SpeedNet</unit>
-    <SpeedSize>MegaBit</SpeedSize>
-  </result>
-  <result>
-    <channel>Upload Speed</channel>
-    <value>$uploadBits</value>
-    <unit>SpeedNet</unit>
-    <SpeedSize>MegaBit</SpeedSize>
-  </result>
-  <result>
-    <channel>Ping - Response time</channel>
-    <value>$pingMs</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
+  # Each <result> block represents a monitored metric in PRTG.
+  # The <channel> specifies the name of the metric.
+  # The <value> provides the measured value for the metric.
+  # The <unit> and optional <CustomUnit> define the unit of measurement.
+  # Additional tags like <Float> or <SpeedSize> provide further details about the metric.
 
-# Handle timeouts and failed lookups
-if ($data.ping.latency -eq $null -or $data.ping.latency -gt 5000) {
-    $prtgResults += @"
   <result>
-    <channel>Ping - Response time</channel>
-    <value>5000</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
+  <channel>Download Speed</channel>  # Channel for download speed in Mbps.
+  <value>$downloadBits</value>       # Value of download speed in bits per second.
+  <unit>SpeedNet</unit>              # Unit type for network speed.
+  <SpeedSize>MegaBit</SpeedSize>     # Specifies the size unit as Megabits.
   </result>
-  <text>Ping response time exceeded threshold or timed out.</text>
-"@
-}
 
-# Handle HTTP response code failures
-if ($data.httpResponseCode -eq "Request Time-out" -or $data.httpResponseCode -eq "Failed") {
-    $prtgResults += @"
   <result>
-    <channel>HTTP Response Code</channel>
-    <value>0</value>
-    <unit>Custom</unit>
-    <CustomUnit>Code</CustomUnit>
+  <channel>Upload Speed</channel>    # Channel for upload speed in Mbps.
+  <value>$uploadBits</value>         # Value of upload speed in bits per second.
+  <unit>SpeedNet</unit>              # Unit type for network speed.
+  <SpeedSize>MegaBit</SpeedSize>     # Specifies the size unit as Megabits.
   </result>
-  <text>HTTP response code indicates a timeout or failure.</text>
-"@
-}
 
-# Default values for missing data
-if (-not $data.ping.latency) {
-    $data.ping.latency = 5000  # Default to 5000 ms for timeouts
-}
-if (-not $data.httpResponseCode) {
-    $data.httpResponseCode = "Request Time-out"  # Default to timeout message
-}
+  <result>
+  <channel>Ping - Response time</channel>  # Channel for ping response time in milliseconds.
+  <value>$pingMs</value>                  # Value of ping response time.
+  <Float>1</Float>                        # Indicates the value is a floating-point number.
+  <unit>TimeResponse</unit>               # Unit type for response time.
+  <CustomUnit>ms</CustomUnit>             # Specifies the custom unit as milliseconds.
+  </result>
+  </result>
+"@) | Out-Null
 
 # Optional detailed stats if requested
 if ($DetailedOutput) {
-    # Download Latency
-    if ($data.download.latency.iqm) {
-        $prtgResults += @"
+  foreach ($key in @("download", "upload", "ping")) {
+    if ($data.$key -and $data.$key.latency) {
+      foreach ($latencyKey in @("iqm", "low", "high", "jitter")) {
+        if ($data.$key.latency.$latencyKey) {
+          $prtgResults.AppendLine(@"
   <result>
-    <channel>Download Latency IQM</channel>
-    <value>$($data.download.latency.iqm)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
+  <channel>$($key.Capitalize()) Latency $($latencyKey.Capitalize())</channel>
+  <value>$($data.$key.latency.$latencyKey)</value>
+  <Float>1</Float>
+  <unit>TimeResponse</unit>
+  <CustomUnit>ms</CustomUnit>
   </result>
-"@
+"@) | Out-Null
+        }
+      }
     }
-    if ($data.download.latency.low) {
-        $prtgResults += @"
+  }
+  if ($data.packetLoss -ne $null) {
+    $prtgResults.AppendLine(@"
   <result>
-    <channel>Download Latency Low</channel>
-    <value>$($data.download.latency.low)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
+  <channel>Packet Loss</channel>
+  <value>$([math]::Round($data.packetLoss, 3))</value>
+  <Float>1</Float>
+  <unit>Percent</unit>
   </result>
-"@
-    }
-    if ($data.download.latency.high) {
-        $prtgResults += @"
-  <result>
-    <channel>Download Latency High</channel>
-    <value>$($data.download.latency.high)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.download.latency.jitter) {
-        $prtgResults += @"
-  <result>
-    <channel>Download Jitter</channel>
-    <value>$($data.download.latency.jitter)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    # Upload Latency
-    if ($data.upload.latency.iqm) {
-        $prtgResults += @"
-  <result>
-    <channel>Upload Latency IQM</channel>
-    <value>$($data.upload.latency.iqm)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.upload.latency.low) {
-        $prtgResults += @"
-  <result>
-    <channel>Upload Latency Low</channel>
-    <value>$($data.upload.latency.low)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.upload.latency.high) {
-        $prtgResults += @"
-  <result>
-    <channel>Upload Latency High</channel>
-    <value>$($data.upload.latency.high)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.upload.latency.jitter) {
-        $prtgResults += @"
-  <result>
-    <channel>Upload Jitter</channel>
-    <value>$($data.upload.latency.jitter)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    # Ping details
-    if ($data.ping.jitter) {
-        $prtgResults += @"
-  <result>
-    <channel>Ping Jitter</channel>
-    <value>$($data.ping.jitter)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.ping.low) {
-        $prtgResults += @"
-  <result>
-    <channel>Ping Low</channel>
-    <value>$($data.ping.low)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    if ($data.ping.high) {
-        $prtgResults += @"
-  <result>
-    <channel>Ping High</channel>
-    <value>$($data.ping.high)</value>
-    <Float>1</Float>
-    <unit>TimeResponse</unit>
-    <CustomUnit>ms</CustomUnit>
-  </result>
-"@
-    }
-    # PacketLoss
-    if ($null -ne $data.packetLoss) {
-        $packetLossPct = [math]::Round($data.packetLoss, 3)
-        $prtgResults += @"
-  <result>
-    <channel>Packet Loss</channel>
-    <value>$packetLossPct</value>
-    <Float>1</Float>
-    <unit>Percent</unit>
-  </result>
-"@
-    }
+"@) | Out-Null
+  }
 }
 
 # Close XML with summary text
-$prtgResults += "  <text>$text</text>`n</prtg>"
+$prtgResults.AppendLine("  <text>$text</text>`n</prtg>") | Out-Null
 
 # Output final PRTG XML (only this!)
-Write-Output $prtgResults
+Write-Output $prtgResults.ToString()
