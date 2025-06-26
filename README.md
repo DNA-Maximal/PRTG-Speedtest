@@ -1,5 +1,7 @@
 # PRTG-Speedtest
 
+## How to install
+
 ## Overview
 
 This repository contains a custom sensor integration for [PRTG Network Monitor](https://www.paessler.com/prtg) that allows you to measure network speed (download, upload, ping, and more) by leveraging the [Ookla Speedtest CLI](https://www.speedtest.net/apps/cli). The sensor is designed as an **EXE/Script Advanced** sensor and outputs its results in PRTG-compatible XML.
